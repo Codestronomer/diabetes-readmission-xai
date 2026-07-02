@@ -1,0 +1,23 @@
+name: diabetes-readmission-xai
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - jupyter
+  - ipykernel
+  - pandas
+  - numpy
+  - scikit-learn
+  - xgboost
+  - imbalanced-learn
+  - matplotlib
+  - seaborn
+  - pyyaml
+  - dvc
+  - pip:
+    - shap
+    - lime
+    - dice-ml
+    - ucimlrepo
