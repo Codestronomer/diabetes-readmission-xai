@@ -5,7 +5,7 @@ from pathlib import Path
 from ucimlrepo import fetch_ucirepo
 
 
-def fetch_and_verify_data(save_dir="../data/raw", filename="diabetes_130_us_raw.csv"):
+def fetch_and_verify_data(save_dir="./data/raw", filename="diabetes_130_us_raw.csv"):
     """
     Fetches the UCI Diabetes 130-US hospitals dataset, verifies its integrity,
     and saves it to the specified raw data directory.
@@ -25,7 +25,7 @@ def fetch_and_verify_data(save_dir="../data/raw", filename="diabetes_130_us_raw.
     y = diabetes.data.targets
     df = pd.concat([ids, X, y], axis=1)
 
-    # Blueprint Verification Gate 1: Check dimensions
+    # Blueprint Verification: Check dimensions
     expected_rows = 101766
     expected_cols = 50  # 49 features + 1 target
 
@@ -56,7 +56,6 @@ def fetch_and_verify_data(save_dir="../data/raw", filename="diabetes_130_us_raw.
 
     print(f"SHA256: {file_hash}")
     print(f"SHA256 Checksum: {file_hash}")
-    print("---------------------------\n")
 
     return df
 
