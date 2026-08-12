@@ -19,17 +19,17 @@ def fetch_and_verify_data(save_dir="./data/raw", filename="diabetes_130_us_raw.c
         print(f"Error fetching data: {e}")
         return None
 
-    # Extract features and targets, then combine
+    # Extract features and targets, and then combine them.
     ids = diabetes.data.ids
     X = diabetes.data.features
     y = diabetes.data.targets
     df = pd.concat([ids, X, y], axis=1)
 
-    # Blueprint Verification: Check dimensions
+    # Check dimensions
     expected_rows = 101766
     expected_cols = 50  # 49 features + 1 target
 
-    print("\n--- Verification Gate 1 ---")
+    print("\nVerification Gate")
     print(f"Actual Shape:   {df.shape}")
     print(f"Expected Shape: ({expected_rows}, {expected_cols})")
 
@@ -37,15 +37,13 @@ def fetch_and_verify_data(save_dir="./data/raw", filename="diabetes_130_us_raw.c
         print("Status: PASSED (Dimensions match perfectly).")
     else:
         print(
-            "Status: FAILED (Dimensions do not match!). Please investigate before proceeding."
+            "Status: FAILED (Dimensions do not match!)."
         )
 
-    # Save to raw data directory
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = save_dir / filename
-
     df.to_csv(file_path, index=False)
 
     print(f"Saved to: {file_path.resolve()}")
