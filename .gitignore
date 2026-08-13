@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Large files (Model artifacts)
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+*.parquet
+
+# Data files (use DVC or external storage)
+data/raw/
+data/processed/
