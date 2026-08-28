@@ -2,12 +2,11 @@ import os
 import joblib
 import pandas as pd
 import numpy as np
-import shap
 import lime
 import lime.lime_tabular
 import matplotlib.pyplot as plt
 
-def run_lime_analysis(data_dir="../../data/processed", model_dir="../../models", output_dir="../../results/figures"):
+def run_lime_analysis(data_dir="data/processed", model_dir="models", output_dir="results/figures"):
     print("--- LIME Explainability Analysis ---")
     
     # 1. Setup Directories
@@ -15,7 +14,14 @@ def run_lime_analysis(data_dir="../../data/processed", model_dir="../../models",
     
     # 2. Load Model and Data
     print("Loading XGBoost model and test data...")
-    xgb_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    raw_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    
+    # Extract XGBClassifier from ImbPipeline if needed
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_model, ImbPipeline):
+        xgb_model = raw_model.named_steps['classifier']
+    else:
+        xgb_model = raw_model
     
     # We use X_test for XAI to evaluate how the model explains unseen, real-world data
     X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
@@ -28,27 +34,8 @@ def run_lime_analysis(data_dir="../../data/processed", model_dir="../../models",
                       .str.replace('<', 'lt_', regex=False)
                       .str.replace('>', 'gt_', regex=False))
 
-    # Sample a subset of the test data for SHAP to ensure reasonable computation time
-    # SHAP TreeExplainer is fast, but rendering thousands of points can freeze plots
-    X_test_sample = shap.sample(X_test, 1000, random_state=42)
+    assert X_test.shape[1] == 227
 
-    print("\nGenerating SHAP Global Explanations...")
-    explainer = shap.TreeExplainer(xgb_model)
-    shap_values = explainer.shap_values(X_test_sample)
-
-    # Generate and save SHAP Summary Plot
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values, X_test_sample, show=False)
-    plt.title("SHAP Summary Plot: Global Feature Impact on Readmission Risk", fontsize=14)
-    plt.tight_layout()
-    shap_fig_path = os.path.join(output_dir, "shap_summary.png")
-    plt.savefig(shap_fig_path, dpi=300)
-    plt.close()
-    print(f"SHAP summary plot saved to: {shap_fig_path}")
-
-    # ---------------------------------------------------------
-    # PART B: LIME (Local Explainability)
-    # ---------------------------------------------------------
     print("\nGenerating LIME Local Explanation for a high-risk patient...")
     
     # Find a patient in the test set who was ACTUALLY readmitted (y_test == 1)
@@ -66,15 +53,15 @@ def run_lime_analysis(data_dir="../../data/processed", model_dir="../../models",
 
     # Initialize LIME Tabular Explainer
     # LIME requires the training data distribution to build its local surrogate models
-    # We load a small sample of X_train just to fit the LIME explainer
     X_train_sample = pd.read_csv(os.path.join(data_dir, "X_train.csv"), nrows=5000)
-    X_train_sample.columns = X_test.columns # Apply sanitized columns
+    X_train_sample.columns = X_test.columns
     
     lime_explainer = lime.lime_tabular.LimeTabularExplainer(
         training_data=X_train_sample.values,
         feature_names=X_test.columns.tolist(),
         class_names=['Not Readmitted', 'Readmitted'],
         mode='classification',
+        kernel_width=0.75,
         random_state=42
     )
 
@@ -95,4 +82,5 @@ def run_lime_analysis(data_dir="../../data/processed", model_dir="../../models",
     plt.close()
     print(f"LIME patient explanation saved to: {lime_fig_path}")
 
-run_lime_analysis()
+if __name__ == "__main__":
+    run_lime_analysis()
