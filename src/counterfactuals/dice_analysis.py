@@ -2,9 +2,6 @@ import os
 import joblib
 import pandas as pd
 import numpy as np
-import shap
-import lime
-import lime.lime_tabular
 import dice_ml
 import matplotlib.pyplot as plt
 
@@ -25,10 +22,10 @@ class XGBoostDiceWrapper:
             X = X.astype(np.float64)
         return self.model.predict(X)
 
-def run_dice_analysis(data_dir="../../data/processed", model_dir="../../models", output_dir="../../results"):
+def run_dice_analysis(data_dir="data/processed", model_dir="models", output_dir="results"):
     print("--- DiCE Counterfactual Explanations ---")
     
-    # Setup Output Directories
+    # Setup Output Directoriesx
     fig_dir = os.path.join(output_dir, "figures")
     tbl_dir = os.path.join(output_dir, "tables")
     os.makedirs(fig_dir, exist_ok=True)
@@ -37,6 +34,13 @@ def run_dice_analysis(data_dir="../../data/processed", model_dir="../../models",
     # 1. Load XGBoost Model and Processed Data
     print("Loading XGBoost model and training/testing sets...")
     raw_xgb_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    
+    # Extract XGBClassifier from ImbPipeline if needed
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_xgb_model, ImbPipeline):
+        xgb_model = raw_xgb_model.named_steps['classifier']
+    else:
+        xgb_model = raw_xgb_model
     
     X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
     y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
@@ -106,7 +110,8 @@ def run_dice_analysis(data_dir="../../data/processed", model_dir="../../models",
         query_instances=query_instance,
         total_CFs=3,
         desired_class=0,
-        features_to_vary=actionable_features
+        features_to_vary=actionable_features,
+        posthoc_sparsity_param=0.1
     )
 
     # 6. Process and Export Results
@@ -155,4 +160,91 @@ def run_dice_analysis(data_dir="../../data/processed", model_dir="../../models",
     else:
         print("No valid counterfactuals found within specified perturbation constraints.")
 
-run_dice_analysis()
+    # ------------------------------------------------------------------
+    # PART B: Batch Evaluation — 500 High-Risk Patients
+    # ------------------------------------------------------------------
+    print("\n=== DiCE Batch Evaluation: 500 High-Risk Patients ===")
+    
+    high_risk_batch_indices = np.where((y_test == 1) & (probs > 0.60))[0]
+    n_batch = min(500, len(high_risk_batch_indices))
+    high_risk_batch_indices = high_risk_batch_indices[:n_batch]
+    print(f"Selected {n_batch} high-risk true positives (P(Y=1|x) > 0.60)")
+    
+    batch_results = []
+    for i, idx in enumerate(high_risk_batch_indices):
+        if (i + 1) % 50 == 0:
+            print(f"  Processing patient {i+1}/{n_batch}...")
+        
+        query = X_test.iloc[[idx]]
+        try:
+            cf_res = exp.generate_counterfactuals(
+                query_instances=query,
+                total_CFs=3,
+                desired_class=0,
+                features_to_vary=actionable_features,
+                posthoc_sparsity_param=0.1
+            )
+            cf_df_batch = cf_res.cf_examples_list[0].final_cfs_df
+            
+            if cf_df_batch is not None and not cf_df_batch.empty:
+                # Sparsity: number of changed features per CF
+                orig_vals = query.values[0]
+                cf_vals = cf_df_batch[X_test.columns].values
+                n_changed = np.sum(~np.isclose(cf_vals, orig_vals), axis=1)
+                avg_sparsity = np.mean(n_changed)
+                
+                # Proximity: normalised L1 distance for continuous features
+                cont_cols = [c for c in continuous_features if c in X_test.columns]
+                if cont_cols:
+                    orig_cont = query[cont_cols].values[0]
+                    cf_cont = cf_df_batch[cont_cols].values
+                    mad = np.median(np.abs(X_train[cont_cols].values - np.median(X_train[cont_cols].values, axis=0)), axis=0)
+                    mad[mad == 0] = 1.0
+                    l1_dist = np.mean(np.abs(cf_cont - orig_cont) / mad)
+                else:
+                    l1_dist = 0.0
+                
+                # Actionability: no immutable features changed
+                immut_cols = [c for c in immutable_features if c in X_test.columns]
+                if immut_cols:
+                    orig_immut = query[immut_cols].values[0]
+                    cf_immut = cf_df_batch[immut_cols].values
+                    immut_violated = np.any(~np.isclose(cf_immut, orig_immut))
+                else:
+                    immut_violated = False
+                
+                # DPP diversity: pairwise Euclidean distance between CFs
+                if len(cf_df_batch) >= 2:
+                    cf_matrix = cf_df_batch[X_test.columns].values.astype(float)
+                    pairwise_dists = []
+                    for a in range(len(cf_matrix)):
+                        for b in range(a + 1, len(cf_matrix)):
+                            pairwise_dists.append(np.sqrt(np.sum((cf_matrix[a] - cf_matrix[b]) ** 2)))
+                    dpp_diversity = np.mean(pairwise_dists) if pairwise_dists else 0.0
+                else:
+                    dpp_diversity = 0.0
+                
+                batch_results.append({
+                    'patient_idx': idx,
+                    'sparsity': avg_sparsity,
+                    'proximity': l1_dist,
+                    'actionable': not immut_violated,
+                    'dpp_diversity': dpp_diversity
+                })
+        except Exception as e:
+            continue
+    
+    if batch_results:
+        batch_df = pd.DataFrame(batch_results)
+        batch_csv_path = os.path.join(tbl_dir, "dice_batch_metrics.csv")
+        batch_df.to_csv(batch_csv_path, index=False)
+        print(f"\nBatch metrics saved to: {batch_csv_path}")
+        print(f"  Average Sparsity: {batch_df['sparsity'].mean():.2f} features")
+        print(f"  Average Proximity (L1): {batch_df['proximity'].mean():.2f}")
+        print(f"  Actionability Validity: {batch_df['actionable'].mean()*100:.2f}%")
+        print(f"  Average DPP Diversity: {batch_df['dpp_diversity'].mean():.2f}")
+    else:
+        print("No valid batch counterfactuals generated.")
+
+if __name__ == "__main__":
+    run_dice_analysis()
