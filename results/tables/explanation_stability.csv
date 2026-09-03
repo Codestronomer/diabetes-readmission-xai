@@ -1,0 +1,5 @@
+Metric,Value
+"Mean Spearman Rank Correlation (SHAP, LIME)",0.73
+Top 3 Feature Alignment Rate (%),0.0
+Top 5 Feature Alignment Rate (%),0.0
+N_patients_evaluated,1000.0

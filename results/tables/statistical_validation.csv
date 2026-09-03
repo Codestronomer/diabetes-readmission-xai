@@ -1,0 +1,12 @@
+DeLong Test Results
+Comparison,Z_score,p_value,AUC_XGB,AUC_Random Forest,CI_XGB_lower,CI_XGB_upper,CI_other_lower,CI_other_upper,AUC_Decision Tree,AUC_Logistic Regression
+XGBoost vs Random Forest,-4.45,8.497e-06,0.6643,0.6385,0.6475,0.6811,0.6221,0.6548,,
+XGBoost vs Decision Tree,-7.8,6.300e-15,0.6643,,0.6475,0.6811,0.5811,0.6168,0.599,
+XGBoost vs Logistic Regression,-7.2,6.032e-13,0.6643,,0.6475,0.6811,0.5994,0.6337,,0.6165
+
+Bootstrap CI Results
+Model,Metric,Empirical_Mean,CI_Lower,CI_Upper
+XGBoost,ROC-AUC,0.6643,0.6474,0.6813
+XGBoost,F1-Score,0.4842,0.479,0.4902
+Logistic Regression,ROC-AUC,0.6165,0.6,0.6345
+Decision Tree,ROC-AUC,0.599,0.5811,0.6169
