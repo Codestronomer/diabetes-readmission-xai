@@ -1,0 +1,1851 @@
+================================================================================
+MSc Diabetes Readmission XAI — Full Codebase
+Sequential Pipeline: Setup → Data → Training → XAI → Evaluation → Figures
+================================================================================
+
+================================================================================
+1. DEPENDENCIES — environment.yml
+================================================================================
+name: diabetes-readmission-xai
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.20
+  - pip
+  - jupyter
+  - ipykernel
+  - pandas=2.3.3
+  - numpy=2.2.6
+  - scipy=1.15.2
+  - scikit-learn=1.7.2
+  - xgboost=3.2.0
+  - imbalanced-learn=0.14.2
+  - matplotlib=3.10.9
+  - seaborn=0.13.2
+  - pyyaml=6.0.3
+  - joblib=1.5.3
+  - dvc=3.67.1
+  - pip:
+    - shap==0.49.1
+    - lime==0.2.0.1
+    - dice-ml==0.12
+    - ucimlrepo
+    - MLstatkit==0.1.91
+
+
+================================================================================
+2. DATA ACQUISITION — src/data.py
+================================================================================
+import os
+import hashlib
+import pandas as pd
+from pathlib import Path
+from ucimlrepo import fetch_ucirepo
+
+
+def fetch_and_verify_data(save_dir="./data/raw", filename="diabetes_130_us_raw.csv"):
+    """
+    Fetches the UCI Diabetes 130-US hospitals dataset, verifies its integrity,
+    and saves it to the specified raw data directory.
+    """
+    print("Fetching Diabetes 130-US hospitals dataset from UCI (ID: 296)...")
+
+    try:
+        # Fetch dataset
+        diabetes = fetch_ucirepo(id=296)
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return None
+
+    # Extract features and targets, and then combine them.
+    ids = diabetes.data.ids
+    X = diabetes.data.features
+    y = diabetes.data.targets
+    df = pd.concat([ids, X, y], axis=1)
+
+    # Check dimensions
+    expected_rows = 101766
+    expected_cols = 50  # 49 features + 1 target
+
+    print("\nVerification Gate")
+    print(f"Actual Shape:   {df.shape}")
+    print(f"Expected Shape: ({expected_rows}, {expected_cols})")
+
+    if df.shape[0] == expected_rows and df.shape[1] == expected_cols:
+        print("Status: PASSED (Dimensions match perfectly).")
+    else:
+        print(
+            "Status: FAILED (Dimensions do not match!)."
+        )
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = save_dir / filename
+    df.to_csv(file_path, index=False)
+
+    print(f"Saved to: {file_path.resolve()}")
+    print(f"Exists: {file_path.exists()}")
+
+    with open(file_path, "rb") as f:
+        file_hash = hashlib.sha256(f.read()).hexdigest()
+
+    print(f"SHA256: {file_hash}")
+    print(f"SHA256 Checksum: {file_hash}")
+
+    return df
+
+
+if __name__ == "__main__":
+    fetch_and_verify_data()
+
+
+================================================================================
+3. MODEL TRAINING — src/models/train_dt.py (Decision Tree)
+================================================================================
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score, f1_score, accuracy_score,
+    precision_score, recall_score, brier_score_loss,
+)
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def train_decision_tree(data_dir=None, model_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+
+    print("--- Training Decision Tree (SMOTE within CV folds) ---")
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    param_grid = {
+        'classifier__max_depth': [4, 5, 6, 7, 8],
+        'classifier__criterion': ['gini', 'entropy'],
+        'classifier__min_samples_split': [10, 20, 50],
+    }
+
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', DecisionTreeClassifier(random_state=42)),
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(pipeline, param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+
+    best_dt = grid_search.best_estimator_
+    print(f"Best Hyperparameters: {grid_search.best_params_}")
+
+    y_test_probs = best_dt.predict_proba(X_test)[:, 1]
+    y_test_preds = best_dt.predict(X_test)
+
+    print("\nTest Metrics:")
+    print(f"  AUC-ROC:        {roc_auc_score(y_test, y_test_probs):.4f}")
+    print(f"  F1-Score:       {f1_score(y_test, y_test_preds):.4f}")
+    print(f"  Accuracy:       {accuracy_score(y_test, y_test_preds):.4f}")
+    print(f"  Precision:      {precision_score(y_test, y_test_preds):.4f}")
+    print(f"  Recall (Sens):  {recall_score(y_test, y_test_preds):.4f}")
+    print(f"  Brier Score:    {brier_score_loss(y_test, y_test_probs):.4f}")
+
+    importances = best_dt.named_steps['classifier'].feature_importances_
+    features_df = pd.DataFrame({
+        'Feature': X_train.columns,
+        'Gini_Importance': importances,
+    }).sort_values(by='Gini_Importance', ascending=False)
+
+    print("\nTop 5 Most Informative Splits (Gini Importance):")
+    print(features_df.head(5).to_string(index=False))
+
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "decision_tree.pkl")
+    joblib.dump(best_dt, model_path)
+    print(f"\nModel artifact serialized to: {model_path}\n")
+
+
+if __name__ == "__main__":
+    train_decision_tree()
+
+
+================================================================================
+4. MODEL TRAINING — src/models/train_lr.py (Logistic Regression)
+================================================================================
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score, f1_score, accuracy_score,
+    precision_score, recall_score, brier_score_loss,
+)
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def train_logistic_regression(data_dir=None, model_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+
+    print("--- Training Logistic Regression (SMOTE within CV folds) ---")
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    param_grid = {
+        'classifier__C': [0.001, 0.01, 0.1, 1, 10, 100],
+        'classifier__penalty': ['l2'],
+    }
+
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', LogisticRegression(solver='lbfgs', random_state=42, max_iter=1000)),
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(pipeline, param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+
+    best_lr = grid_search.best_estimator_
+    print(f"Best Hyperparameters: {grid_search.best_params_}")
+
+    y_test_probs = best_lr.predict_proba(X_test)[:, 1]
+    y_test_preds = best_lr.predict(X_test)
+
+    print("\nTest Metrics:")
+    print(f"  AUC-ROC:        {roc_auc_score(y_test, y_test_probs):.4f}")
+    print(f"  F1-Score:       {f1_score(y_test, y_test_preds):.4f}")
+    print(f"  Accuracy:       {accuracy_score(y_test, y_test_preds):.4f}")
+    print(f"  Precision:      {precision_score(y_test, y_test_preds):.4f}")
+    print(f"  Recall (Sens):  {recall_score(y_test, y_test_preds):.4f}")
+    print(f"  Brier Score:    {brier_score_loss(y_test, y_test_probs):.4f}")
+
+    coefficients = best_lr.named_steps['classifier'].coef_[0]
+    odds_ratios = np.exp(coefficients)
+
+    features_df = pd.DataFrame({
+        'Feature': X_train.columns,
+        'Coefficient': coefficients,
+        'Odds_Ratio': odds_ratios,
+    }).sort_values(by='Odds_Ratio', ascending=False)
+
+    print("\nTop 5 Features Increasing Readmission Risk (Odds Ratio > 1):")
+    print(features_df.head(5).to_string(index=False))
+    print("\nTop 5 Features Decreasing Readmission Risk (Odds Ratio < 1):")
+    print(features_df.tail(5).to_string(index=False))
+
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "logistic_regression.pkl")
+    joblib.dump(best_lr, model_path)
+    print(f"\nModel artifact serialized to: {model_path}\n")
+
+
+if __name__ == "__main__":
+    train_logistic_regression()
+
+
+================================================================================
+5. MODEL TRAINING — src/models/train_rf.py (Random Forest)
+================================================================================
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score, f1_score, accuracy_score,
+    precision_score, recall_score, brier_score_loss,
+)
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def train_random_forest(data_dir=None, model_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+
+    print("--- Training Random Forest (SMOTE within CV folds) ---")
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    param_grid = {
+        'classifier__n_estimators': [100, 200],
+        'classifier__max_depth': [10, 15, 20],
+        'classifier__min_samples_split': [5, 10],
+        'classifier__max_features': ['sqrt', 'log2'],
+    }
+
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', RandomForestClassifier(
+            random_state=42, class_weight='balanced', n_jobs=-1,
+        )),
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(pipeline, param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+
+    best_rf = grid_search.best_estimator_
+    print(f"Best Hyperparameters: {grid_search.best_params_}")
+
+    y_test_probs = best_rf.predict_proba(X_test)[:, 1]
+    y_test_preds = best_rf.predict(X_test)
+
+    print("\nTest Metrics:")
+    print(f"  AUC-ROC:        {roc_auc_score(y_test, y_test_probs):.4f}")
+    print(f"  F1-Score:       {f1_score(y_test, y_test_preds):.4f}")
+    print(f"  Accuracy:       {accuracy_score(y_test, y_test_preds):.4f}")
+    print(f"  Precision:      {precision_score(y_test, y_test_preds):.4f}")
+    print(f"  Recall (Sens):  {recall_score(y_test, y_test_preds):.4f}")
+    print(f"  Brier Score:    {brier_score_loss(y_test, y_test_probs):.4f}")
+
+    importances = best_rf.named_steps['classifier'].feature_importances_
+    features_df = pd.DataFrame({
+        'Feature': X_train.columns,
+        'Importance': importances,
+    }).sort_values(by='Importance', ascending=False)
+
+    print("\nTop 5 Gini Importance Features:")
+    print(features_df.head(5).to_string(index=False))
+
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "random_forest.pkl")
+    joblib.dump(best_rf, model_path)
+    print(f"\nModel artifact serialized to: {model_path}\n")
+
+
+if __name__ == "__main__":
+    train_random_forest()
+
+
+================================================================================
+6. MODEL TRAINING — src/models/train_xgb.py (XGBoost)
+================================================================================
+import os
+import joblib
+import numpy as np
+import pandas as pd
+from xgboost import XGBClassifier
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score, f1_score, accuracy_score,
+    precision_score, recall_score, brier_score_loss,
+)
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def train_xgboost(data_dir=None, model_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+
+    print("--- Training XGBoost (SMOTE within CV folds) ---")
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # Sanitize feature names for XGBoost C++ backend
+    for df in [X_train, X_test]:
+        df.columns = (df.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    param_grid = {
+        'classifier__max_depth': [3, 5, 7],
+        'classifier__learning_rate': [0.01, 0.05, 0.1],
+        'classifier__n_estimators': [100, 300, 500],
+        'classifier__subsample': [0.7, 0.8, 1.0],
+        'classifier__colsample_bytree': [0.7, 0.8, 1.0],
+    }
+
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=42)),
+        ('classifier', XGBClassifier(
+            tree_method='hist',
+            random_state=42,
+            eval_metric='logloss',
+            n_jobs=-1,
+        )),
+    ])
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    grid_search = GridSearchCV(pipeline, param_grid, cv=cv, scoring='roc_auc', n_jobs=-1)
+    grid_search.fit(X_train, y_train)
+
+    best_xgb = grid_search.best_estimator_
+    print(f"Best Hyperparameters: {grid_search.best_params_}")
+
+    y_test_probs = best_xgb.predict_proba(X_test)[:, 1]
+    y_test_preds = best_xgb.predict(X_test)
+
+    print("\nTest Metrics:")
+    print(f"  AUC-ROC:        {roc_auc_score(y_test, y_test_probs):.4f}")
+    print(f"  F1-Score:       {f1_score(y_test, y_test_preds):.4f}")
+    print(f"  Accuracy:       {accuracy_score(y_test, y_test_preds):.4f}")
+    print(f"  Precision:      {precision_score(y_test, y_test_preds):.4f}")
+    print(f"  Recall (Sens):  {recall_score(y_test, y_test_preds):.4f}")
+    print(f"  Brier Score:    {brier_score_loss(y_test, y_test_probs):.4f}")
+
+    importances = best_xgb.named_steps['classifier'].feature_importances_
+    features_df = pd.DataFrame({
+        'Feature': X_train.columns,
+        'Gain_Importance': importances,
+    }).sort_values(by='Gain_Importance', ascending=False)
+
+    print("\nTop 5 Gain Importance Features:")
+    print(features_df.head(5).to_string(index=False))
+
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "xgboost.pkl")
+    joblib.dump(best_xgb, model_path)
+    print(f"\nModel artifact serialized to: {model_path}\n")
+
+
+if __name__ == "__main__":
+    train_xgboost()
+
+
+================================================================================
+7. SHAP EXPLAINABILITY — src/explainability/shap_analysis.py
+================================================================================
+import os
+import joblib
+import pandas as pd
+import numpy as np
+import shap
+import matplotlib.pyplot as plt
+
+
+def _patch_xgboost_shap_compat():
+    """Monkey-patch SHAP to handle XGBoost 3.2.0 base_score serialization."""
+    import shap.explainers._tree as shap_tree
+    if hasattr(shap_tree, "_orig_decode_ubjson_buffer"):
+        return  # already patched
+
+    shap_tree._orig_decode_ubjson_buffer = shap_tree.decode_ubjson_buffer
+
+    def _patched_decode_ubjson_buffer(fd):
+        jmodel = shap_tree._orig_decode_ubjson_buffer(fd)
+        try:
+            learner_param = jmodel.get("learner", {}).get("learner_model_param", {})
+            if "base_score" in learner_param:
+                bs = str(learner_param["base_score"])
+                if bs.startswith("[") and bs.endswith("]"):
+                    learner_param["base_score"] = bs.strip("[]")
+        except Exception:
+            pass
+        return jmodel
+
+    shap_tree.decode_ubjson_buffer = _patched_decode_ubjson_buffer
+
+
+def run_shap_analysis(data_dir="data/processed", model_dir="models", output_dir="results/figures"):
+    print("--- SHAP Explainability Analysis ---")
+
+    # Setup Directories
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load Model and Data
+    print("Loading XGBoost model and test data...")
+    raw_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+
+    # Extract XGBClassifier from ImbPipeline if needed
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_model, ImbPipeline):
+        xgb_model = raw_model.named_steps['classifier']
+    else:
+        xgb_model = raw_model
+
+    # Load Test Data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # Sanitize feature column names
+    X_test.columns = (X_test.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    # Sample subset for SHAP calculation speed
+    X_test_sample = shap.sample(X_test, 1000, random_state=42)
+
+    # Load 100 background samples for background distribution
+    print("Loading 100 background samples from training set...")
+    X_train_bg = shap.sample(
+        pd.read_csv(os.path.join(data_dir, "X_train.csv")).rename(
+            columns=lambda c: c.replace('[', '_').replace(']', '_').replace('<', 'lt_').replace('>', 'gt_')
+        ),
+        100, random_state=42
+    )
+
+    # Apply XGBoost 3.2.0 compatibility patch for TreeExplainer
+    _patch_xgboost_shap_compat()
+
+    print("\nGenerating SHAP Global Explanations (TreeExplainer)...")
+    explainer = shap.TreeExplainer(xgb_model, data=X_train_bg)
+    shap_values = explainer(X_test_sample)
+
+    # Handle both 2D (single-output) and 3D (multi-output) SHAP values
+    if len(shap_values.values.shape) == 3:
+        shap_attrib = shap_values.values[:, :, 1]
+    else:
+        shap_attrib = shap_values.values
+
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_attrib, X_test_sample, show=False, max_display=20)
+    plt.title("SHAP Summary Plot: Global Feature Impact on Readmission Risk", fontsize=14)
+    plt.tight_layout()
+    shap_fig_path = os.path.join(output_dir, "shap_summary.png")
+    plt.savefig(shap_fig_path, dpi=300)
+    plt.close()
+    print(f"SHAP summary plot saved to: {shap_fig_path}")
+
+
+if __name__ == "__main__":
+    run_shap_analysis()
+
+
+================================================================================
+8. LIME EXPLAINABILITY — src/explainability/lime_analysis.py
+================================================================================
+import os
+import joblib
+import pandas as pd
+import numpy as np
+import lime
+import lime.lime_tabular
+import matplotlib.pyplot as plt
+
+def run_lime_analysis(data_dir="data/processed", model_dir="models", output_dir="results/figures"):
+    print("--- LIME Explainability Analysis ---")
+    
+    # 1. Setup Directories
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 2. Load Model and Data
+    print("Loading XGBoost model and test data...")
+    raw_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    
+    # Extract XGBClassifier from ImbPipeline if needed
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_model, ImbPipeline):
+        xgb_model = raw_model.named_steps['classifier']
+    else:
+        xgb_model = raw_model
+    
+    # We use X_test for XAI to evaluate how the model explains unseen, real-world data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+    
+    # Apply the same sanitization used during training
+    X_test.columns = (X_test.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    assert X_test.shape[1] == 227
+
+    print("\nGenerating LIME Local Explanation for a high-risk patient...")
+    
+    # Find a patient in the test set who was ACTUALLY readmitted (y_test == 1)
+    # and whom the model assigned a high probability of readmission.
+    probs = xgb_model.predict_proba(X_test)[:, 1]
+    true_positives = np.where((y_test == 1) & (probs > np.percentile(probs, 90)))[0]
+    
+    if len(true_positives) == 0:
+        print("No high-confidence true positives found. Selecting a random true positive.")
+        patient_idx = np.where(y_test == 1)[0][0]
+    else:
+        patient_idx = true_positives[0]
+        
+    print(f"Selected Patient Index: {patient_idx} | Actual: Readmitted | Predicted Prob: {probs[patient_idx]:.4f}")
+
+    # Initialize LIME Tabular Explainer
+    # LIME requires the training data distribution to build its local surrogate models
+    X_train_sample = pd.read_csv(os.path.join(data_dir, "X_train.csv"), nrows=5000)
+    X_train_sample.columns = X_test.columns
+    
+    lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_train_sample.values,
+        feature_names=X_test.columns.tolist(),
+        class_names=['Not Readmitted', 'Readmitted'],
+        mode='classification',
+        kernel_width=0.75,
+        random_state=42
+    )
+
+    # Generate LIME explanation for the selected patient
+    lime_exp = lime_explainer.explain_instance(
+        data_row=X_test.iloc[patient_idx].values,
+        predict_fn=xgb_model.predict_proba,
+        num_features=10
+    )
+
+    # Save LIME plot
+    lime_fig = lime_exp.as_pyplot_figure()
+    lime_fig.set_size_inches(10, 6)
+    plt.title(f"LIME Local Explanation (Patient {patient_idx})", fontsize=14)
+    plt.tight_layout()
+    lime_fig_path = os.path.join(output_dir, "lime_patient_explanation.png")
+    plt.savefig(lime_fig_path, dpi=300)
+    plt.close()
+    print(f"LIME patient explanation saved to: {lime_fig_path}")
+
+if __name__ == "__main__":
+    run_lime_analysis()
+
+
+================================================================================
+9. DiCE COUNTERFACTUALS — src/counterfactuals/dice_analysis.py
+================================================================================
+import os
+import joblib
+import pandas as pd
+import numpy as np
+import dice_ml
+import matplotlib.pyplot as plt
+
+class XGBoostDiceWrapper:
+    """Wrapper around XGBoost to ensure candidate DataFrames from DiCE 
+    are strictly numeric before running predictions."""
+    def __init__(self, model):
+        self.model = model
+        self.classes_ = model.classes_ if hasattr(model, 'classes_') else np.array([0, 1])
+
+    def predict_proba(self, X):
+        if isinstance(X, pd.DataFrame):
+            X = X.astype(np.float64)
+        return self.model.predict_proba(X)
+
+    def predict(self, X):
+        if isinstance(X, pd.DataFrame):
+            X = X.astype(np.float64)
+        return self.model.predict(X)
+
+def run_dice_analysis(data_dir="data/processed", model_dir="models", output_dir="results"):
+    print("--- DiCE Counterfactual Explanations ---")
+    
+    # Setup Output Directoriesx
+    fig_dir = os.path.join(output_dir, "figures")
+    tbl_dir = os.path.join(output_dir, "tables")
+    os.makedirs(fig_dir, exist_ok=True)
+    os.makedirs(tbl_dir, exist_ok=True)
+    
+    # 1. Load XGBoost Model and Processed Data
+    print("Loading XGBoost model and training/testing sets...")
+    raw_xgb_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    
+    # Extract XGBClassifier from ImbPipeline if needed
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_xgb_model, ImbPipeline):
+        xgb_model = raw_xgb_model.named_steps['classifier']
+    else:
+        xgb_model = raw_xgb_model
+    
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+    
+    # Sanitize feature names
+    for df in [X_train, X_test]:
+        df.columns = (df.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    # Force strict float64 numeric schema across all features
+    X_train = X_train.astype(np.float64)
+    X_test = X_test.astype(np.float64)
+
+    # Recombine features and target for DiCE Data object
+    train_df = X_train.copy()
+    train_df['readmitted'] = y_train.astype(np.float64)
+    
+    # 2. Identify Continuous vs. Actionable Features
+    continuous_features = [
+        col for col in X_train.columns 
+        if X_train[col].nunique() > 2 and not col.startswith(('age', 'gender', 'race', 'diag'))
+    ]
+    
+    immutable_features = [
+        col for col in X_train.columns 
+        if col.startswith(('age', 'gender', 'race', 'diag_1', 'diag_2', 'diag_3'))
+    ]
+    actionable_features = [col for col in X_train.columns if col not in immutable_features]
+
+    print(f"Total Features: {X_train.shape[1]}")
+    print(f"Continuous Features Identified: {len(continuous_features)}")
+    print(f"Actionable Features for Recourse: {len(actionable_features)}")
+
+    # 3. Initialize DiCE Data and Wrapped Model
+    d = dice_ml.Data(
+        dataframe=train_df, 
+        continuous_features=continuous_features, 
+        outcome_name='readmitted'
+    )
+    
+    # Wrap model to handle candidate DataFrame type conversions
+    wrapped_model = XGBoostDiceWrapper(raw_xgb_model)
+    m = dice_ml.Model(model=wrapped_model, backend="sklearn", model_type="classifier")
+    
+    exp = dice_ml.Dice(d, m, method="random")
+
+    # 4. Select High-Risk True Positive Instance for Recourse Analysis
+    probs = wrapped_model.predict_proba(X_test)[:, 1]
+    high_risk_tp_indices = np.where((y_test == 1) & (probs > 0.65))[0]
+    
+    patient_idx = high_risk_tp_indices[0] if len(high_risk_tp_indices) > 0 else np.where(y_test == 1)[0][0]
+    query_instance = X_test.iloc[[patient_idx]]
+    orig_prob = probs[patient_idx]
+    
+    print(f"\nTarget Patient Index: {patient_idx}")
+    print(f"Baseline Predicted Readmission Probability: {orig_prob:.4f}")
+
+    # 5. Generate Counterfactual Explanations
+    print("\nGenerating 3 Diverse Counterfactual Scenarios (Target Class: 0 - Not Readmitted)...")
+    
+    dice_exp = exp.generate_counterfactuals(
+        query_instances=query_instance,
+        total_CFs=3,
+        desired_class=0,
+        features_to_vary=actionable_features,
+        posthoc_sparsity_param=0.1
+    )
+
+    # 6. Process and Export Results
+    cf_df = dice_exp.cf_examples_list[0].final_cfs_df
+    
+    if cf_df is not None and not cf_df.empty:
+        csv_path = os.path.join(tbl_dir, f"patient_{patient_idx}_counterfactuals.csv")
+        cf_df.to_csv(csv_path, index=False)
+        print(f"Counterfactual matrix saved to: {csv_path}")
+
+        print("\n--- Key Recourse Changes (Original vs. Counterfactuals) ---")
+        diff_cols = []
+        for col in X_test.columns:
+            orig_val = query_instance[col].values[0]
+            cf_vals = cf_df[col].values
+            if not np.all(np.isclose(cf_vals, orig_val)):
+                diff_cols.append(col)
+                print(f"Feature '{col}': Original = {orig_val} | CF Targets = {list(cf_vals)}")
+
+        if diff_cols:
+            plt.figure(figsize=(10, max(4, len(diff_cols) * 0.8)))
+            plot_data = []
+            
+            orig_vals = query_instance[diff_cols].values[0]
+            for i in range(len(cf_df)):
+                cf_row = cf_df.iloc[i][diff_cols].values
+                plot_data.append(cf_row)
+                
+            y_positions = np.arange(len(diff_cols))
+            height = 0.2
+            
+            plt.barh(y_positions + height*1.5, orig_vals, height=height, label='Original Patient', color='#d9534f')
+            for i, cf_row in enumerate(plot_data):
+                plt.barh(y_positions - height*(i - 0.5), cf_row, height=height, label=f'CF Scenario {i+1}')
+
+            plt.yticks(y_positions, diff_cols)
+            plt.xlabel('Feature Value')
+            plt.title(f'DiCE Counterfactual Levers for Patient {patient_idx} (Recourse to Class 0)', fontsize=12)
+            plt.legend(loc='lower right')
+            plt.tight_layout()
+            
+            fig_path = os.path.join(fig_dir, f"dice_patient_{patient_idx}_recourse.png")
+            plt.savefig(fig_path, dpi=300)
+            plt.close()
+            print(f"Recourse visualization saved to: {fig_path}")
+    else:
+        print("No valid counterfactuals found within specified perturbation constraints.")
+
+    # ------------------------------------------------------------------
+    # PART B: Batch Evaluation — 500 High-Risk Patients
+    # ------------------------------------------------------------------
+    print("\n=== DiCE Batch Evaluation: 500 High-Risk Patients ===")
+    
+    high_risk_batch_indices = np.where((y_test == 1) & (probs > 0.60))[0]
+    n_batch = min(500, len(high_risk_batch_indices))
+    high_risk_batch_indices = high_risk_batch_indices[:n_batch]
+    print(f"Selected {n_batch} high-risk true positives (P(Y=1|x) > 0.60)")
+    
+    batch_results = []
+    for i, idx in enumerate(high_risk_batch_indices):
+        if (i + 1) % 50 == 0:
+            print(f"  Processing patient {i+1}/{n_batch}...")
+        
+        query = X_test.iloc[[idx]]
+        try:
+            cf_res = exp.generate_counterfactuals(
+                query_instances=query,
+                total_CFs=3,
+                desired_class=0,
+                features_to_vary=actionable_features,
+                posthoc_sparsity_param=0.1
+            )
+            cf_df_batch = cf_res.cf_examples_list[0].final_cfs_df
+            
+            if cf_df_batch is not None and not cf_df_batch.empty:
+                # Sparsity: number of changed features per CF
+                orig_vals = query.values[0]
+                cf_vals = cf_df_batch[X_test.columns].values
+                n_changed = np.sum(~np.isclose(cf_vals, orig_vals), axis=1)
+                avg_sparsity = np.mean(n_changed)
+                
+                # Proximity: normalised L1 distance for continuous features
+                cont_cols = [c for c in continuous_features if c in X_test.columns]
+                if cont_cols:
+                    orig_cont = query[cont_cols].values[0]
+                    cf_cont = cf_df_batch[cont_cols].values
+                    mad = np.median(np.abs(X_train[cont_cols].values - np.median(X_train[cont_cols].values, axis=0)), axis=0)
+                    mad[mad == 0] = 1.0
+                    l1_dist = np.mean(np.abs(cf_cont - orig_cont) / mad)
+                else:
+                    l1_dist = 0.0
+                
+                # Actionability: no immutable features changed
+                immut_cols = [c for c in immutable_features if c in X_test.columns]
+                if immut_cols:
+                    orig_immut = query[immut_cols].values[0]
+                    cf_immut = cf_df_batch[immut_cols].values
+                    immut_violated = np.any(~np.isclose(cf_immut, orig_immut))
+                else:
+                    immut_violated = False
+                
+                # DPP diversity: pairwise Euclidean distance between CFs
+                if len(cf_df_batch) >= 2:
+                    cf_matrix = cf_df_batch[X_test.columns].values.astype(float)
+                    pairwise_dists = []
+                    for a in range(len(cf_matrix)):
+                        for b in range(a + 1, len(cf_matrix)):
+                            pairwise_dists.append(np.sqrt(np.sum((cf_matrix[a] - cf_matrix[b]) ** 2)))
+                    dpp_diversity = np.mean(pairwise_dists) if pairwise_dists else 0.0
+                else:
+                    dpp_diversity = 0.0
+                
+                batch_results.append({
+                    'patient_idx': idx,
+                    'sparsity': avg_sparsity,
+                    'proximity': l1_dist,
+                    'actionable': not immut_violated,
+                    'dpp_diversity': dpp_diversity
+                })
+        except Exception as e:
+            continue
+    
+    if batch_results:
+        batch_df = pd.DataFrame(batch_results)
+        batch_csv_path = os.path.join(tbl_dir, "dice_batch_metrics.csv")
+        batch_df.to_csv(batch_csv_path, index=False)
+        print(f"\nBatch metrics saved to: {batch_csv_path}")
+        print(f"  Average Sparsity: {batch_df['sparsity'].mean():.2f} features")
+        print(f"  Average Proximity (L1): {batch_df['proximity'].mean():.2f}")
+        print(f"  Actionability Validity: {batch_df['actionable'].mean()*100:.2f}%")
+        print(f"  Average DPP Diversity: {batch_df['dpp_diversity'].mean():.2f}")
+    else:
+        print("No valid batch counterfactuals generated.")
+
+if __name__ == "__main__":
+    run_dice_analysis()
+
+
+================================================================================
+10. EVALUATION — src/evaluation.py
+================================================================================
+import os
+import joblib
+import pandas as pd
+import numpy as np
+from scipy.stats import spearmanr
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+import shap
+import lime
+import lime.lime_tabular
+from MLstatkit import Delong_test, Bootstrapping
+import matplotlib.pyplot as plt
+
+
+def _patch_xgboost_shap_compat():
+    """Monkey-patch SHAP to handle XGBoost 3.2.0 base_score serialization."""
+    import shap.explainers._tree as shap_tree
+    if hasattr(shap_tree, "_orig_decode_ubjson_buffer"):
+        return
+    shap_tree._orig_decode_ubjson_buffer = shap_tree.decode_ubjson_buffer
+
+    def _patched_decode_ubjson_buffer(fd):
+        jmodel = shap_tree._orig_decode_ubjson_buffer(fd)
+        try:
+            learner_param = jmodel.get("learner", {}).get("learner_model_param", {})
+            if "base_score" in learner_param:
+                bs = str(learner_param["base_score"])
+                if bs.startswith("[") and bs.endswith("]"):
+                    learner_param["base_score"] = bs.strip("[]")
+        except Exception:
+            pass
+        return jmodel
+
+    shap_tree.decode_ubjson_buffer = _patched_decode_ubjson_buffer
+
+
+# ======================================================================
+# PART A: Clinical Faithfulness Analysis
+# ======================================================================
+
+def run_clinical_faithfulness(data_dir="data/processed", model_dir="models", output_dir="results/tables"):
+    """
+    Benchmark post-hoc XAI attributions (SHAP, LIME) against ground-truth
+    model mechanics (LR log-odds, DT Gini impurity) via Spearman rank correlation.
+    """
+    print("=" * 60)
+    print("Clinical Faithfulness Analysis")
+    print("=" * 60)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Load preprocessed data
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # Sanitize feature names
+    for df in [X_train, X_test]:
+        df.columns = (df.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    feature_names = X_test.columns.tolist()
+
+    # 2. Train fresh L2-regularized Logistic Regression
+    print("\nTraining L2-regularized Logistic Regression for ground-truth benchmark...")
+    lr_l2 = LogisticRegression(
+        penalty='l2', C=1.0, solver='lbfgs', max_iter=1000, random_state=42
+    )
+    lr_l2.fit(X_train.values, y_train)
+    lr_importance = np.abs(lr_l2.coef_[0])
+
+    # 3. Train fresh CART Decision Tree — Gini impurity as ground truth
+    print("Training CART Decision Tree (Gini) for ground-truth benchmark...")
+    dt = DecisionTreeClassifier(criterion='gini', random_state=42)
+    dt.fit(X_train.values, y_train)
+    dt_importance = dt.feature_importances_
+
+    # 4. Sample 1000 test instances for XAI evaluation
+    n_eval = min(1000, len(X_test))
+    eval_indices = np.random.RandomState(42).choice(len(X_test), n_eval, replace=False)
+    X_eval = X_test.iloc[eval_indices]
+
+    # 5. SHAP explanations for LR
+    print("Generating SHAP explanations for LR...")
+    X_train_bg = shap.sample(X_train, 100, random_state=42)
+    lr_explainer = shap.Explainer(lr_l2, X_train_bg)
+    lr_shap_values = lr_explainer(X_eval)
+    lr_shap_importance = np.abs(lr_shap_values.values).mean(axis=0)
+
+    # 6. SHAP explanations for DT
+    print("Generating SHAP explanations for DT...")
+    dt_explainer = shap.Explainer(dt, X_train_bg)
+    dt_shap_values = dt_explainer(X_eval, check_additivity=False)
+    if len(dt_shap_values.shape) == 3:
+        dt_shap_importance = np.abs(dt_shap_values.values[:, :, 1]).mean(axis=0)
+    else:
+        dt_shap_importance = np.abs(dt_shap_values.values).mean(axis=0)
+
+    # 7. LIME explanations for LR
+    print("Generating LIME explanations for LR...")
+    lr_lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_train.values,
+        feature_names=feature_names,
+        class_names=['Not Readmitted', 'Readmitted'],
+        mode='classification',
+        kernel_width=0.75,
+        random_state=42
+    )
+
+    lr_lime_avg = np.zeros(len(feature_names))
+    n_lime_samples = min(200, n_eval)  # LIME is slower, use subset
+    for i in range(n_lime_samples):
+        exp = lr_lime_explainer.explain_instance(
+            data_row=X_eval.iloc[i].values,
+            predict_fn=lr_l2.predict_proba,
+            num_features=len(feature_names)
+        )
+        for feat_name, weight in exp.local_exp[1]:
+            lr_lime_avg[feat_name] += np.abs(weight)
+    lr_lime_avg /= n_lime_samples
+
+    # 8. LIME explanations for DT
+    print("Generating LIME explanations for DT...")
+    dt_lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_train.values,
+        feature_names=feature_names,
+        class_names=['Not Readmitted', 'Readmitted'],
+        mode='classification',
+        kernel_width=0.75,
+        random_state=42
+    )
+
+    dt_lime_avg = np.zeros(len(feature_names))
+    for i in range(n_lime_samples):
+        exp = dt_lime_explainer.explain_instance(
+            data_row=X_eval.iloc[i].values,
+            predict_fn=dt.predict_proba,
+            num_features=len(feature_names)
+        )
+        for feat_name, weight in exp.local_exp[1]:
+            dt_lime_avg[feat_name] += np.abs(weight)
+    dt_lime_avg /= n_lime_samples
+
+    # 9. Compute Spearman rank correlations
+    print("\n--- Spearman Rank Correlations ---")
+    results = []
+
+    pairs = [
+        ("SHAP vs LR Coefficients", lr_shap_importance, lr_importance),
+        ("LIME vs LR Coefficients", lr_lime_avg, lr_importance),
+        ("SHAP vs DT Gini", dt_shap_importance, dt_importance),
+        ("LIME vs DT Gini", dt_lime_avg, dt_importance),
+    ]
+
+    for label, xai_imp, gt_imp in pairs:
+        rho, p_val = spearmanr(xai_imp, gt_imp)
+
+        # Top-k overlap
+        xai_top5 = set(np.argsort(xai_imp)[-5:])
+        gt_top5 = set(np.argsort(gt_imp)[-5:])
+        overlap5 = len(xai_top5 & gt_top5) / 5 * 100
+
+        xai_top10 = set(np.argsort(xai_imp)[-10:])
+        gt_top10 = set(np.argsort(gt_imp)[-10:])
+        overlap10 = len(xai_top10 & gt_top10) / 10 * 100
+
+        print(f"  {label}: rho={rho:.2f} (p={p_val:.2e}), Top-5 overlap={overlap5:.0f}%, Top-10 overlap={overlap10:.0f}%")
+        results.append({
+            'Benchmark': label,
+            'Spearman_rho': round(rho, 2),
+            'p_value': f'{p_val:.2e}',
+            'Top5_Overlap_Pct': overlap5,
+            'Top10_Overlap_Pct': overlap10
+        })
+
+    results_df = pd.DataFrame(results)
+    csv_path = os.path.join(output_dir, "clinical_faithfulness.csv")
+    results_df.to_csv(csv_path, index=False)
+    print(f"\nResults saved to: {csv_path}")
+
+    return results_df
+
+
+# ======================================================================
+# PART B: Statistical Validation & Hypothesis Testing
+# ======================================================================
+
+def run_statistical_validation(data_dir="data/processed", model_dir="models", output_dir="results/tables"):
+    """
+    DeLong tests (pairwise AUC comparison) and bootstrap CIs (1000 resamples).
+    """
+    print("\n" + "=" * 60)
+    print("Statistical Validation & Hypothesis Testing")
+    print("=" * 60)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 1. Load test data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    X_test_sanitized = X_test.copy()
+    X_test_sanitized.columns = (X_test_sanitized.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # No global sanitization — each model may expect different column names.
+    # We'll align per-model below.
+
+    # 2. Load trained models and get predicted probabilities
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    models = {}
+    for name in ['logistic_regression', 'decision_tree', 'random_forest', 'xgboost']:
+        path = os.path.join(model_dir, f"{name}.pkl")
+        raw = joblib.load(path)
+        if isinstance(raw, ImbPipeline):
+            models[name] = raw.named_steps['classifier']
+        else:
+            models[name] = raw
+
+    def get_expected_features(model):
+        if hasattr(model, 'feature_names_in_'):
+            return list(model.feature_names_in_)
+        if hasattr(model, 'get_booster'):
+            return model.get_booster().feature_names
+        return None
+
+    def align_features(X, expected_features):
+        if expected_features is not None:
+            return X[expected_features]
+        return X
+
+    probs = {}
+    for name, model in models.items():
+        expected = get_expected_features(model)
+        if expected is not None:
+            # Try original data first, then sanitized
+            if all(f in X_test.columns for f in expected):
+                X_aligned = X_test[expected]
+            elif all(f in X_test_sanitized.columns for f in expected):
+                X_aligned = X_test_sanitized[expected]
+            else:
+                raise ValueError(f"Model {name}: cannot find expected features in either dataset version")
+        else:
+            X_aligned = X_test
+        probs[name] = model.predict_proba(X_aligned)[:, 1]
+
+    model_display = {
+        'xgboost': 'XGBoost',
+        'random_forest': 'Random Forest',
+        'decision_tree': 'Decision Tree',
+        'logistic_regression': 'Logistic Regression'
+    }
+
+    # 3. Pairwise DeLong tests: XGBoost vs each
+    print("\n--- DeLong Tests (XGBoost vs each model) ---")
+    delong_results = []
+    for name in ['random_forest', 'decision_tree', 'logistic_regression']:
+        z, p_val, ci_xgb, ci_other, auc_xgb, auc_other, info = Delong_test(
+            y_test, probs['xgboost'], probs[name],
+            alpha=0.95, return_ci=True, return_auc=True, verbose=0
+        )
+        print(f"  XGBoost vs {model_display[name]}: Z={z:.2f}, p={p_val:.3e}, "
+              f"AUC_XGB={auc_xgb:.4f}, AUC_{model_display[name]}={auc_other:.4f}")
+        delong_results.append({
+            'Comparison': f"XGBoost vs {model_display[name]}",
+            'Z_score': round(z, 2),
+            'p_value': f'{p_val:.3e}',
+            'AUC_XGB': round(auc_xgb, 4),
+            f'AUC_{model_display[name]}': round(auc_other, 4),
+            'CI_XGB_lower': round(ci_xgb[0], 4),
+            'CI_XGB_upper': round(ci_xgb[1], 4),
+            'CI_other_lower': round(ci_other[0], 4),
+            'CI_other_upper': round(ci_other[1], 4)
+        })
+
+    # 4. Bootstrap CIs (1000 resamples)
+    print("\n--- Bootstrap CIs (1000 resamples) ---")
+    bootstrap_results = []
+    for name in ['xgboost', 'logistic_regression', 'decision_tree']:
+        # ROC-AUC
+        auc_score, auc_lower, auc_upper = Bootstrapping(
+            y_test, probs[name], 'roc_auc', n_bootstraps=1000, confidence_level=0.95
+        )
+        print(f"  {model_display[name]} ROC-AUC: {auc_score:.4f} [{auc_lower:.4f}, {auc_upper:.4f}]")
+        bootstrap_results.append({
+            'Model': model_display[name],
+            'Metric': 'ROC-AUC',
+            'Empirical_Mean': round(auc_score, 4),
+            'CI_Lower': round(auc_lower, 4),
+            'CI_Upper': round(auc_upper, 4)
+        })
+
+        # F1 (only for XGBoost)
+        if name == 'xgboost':
+            f1_score_val, f1_lower, f1_upper = Bootstrapping(
+                y_test, probs[name], 'f1', n_bootstraps=1000, confidence_level=0.95, threshold=0.5
+            )
+            print(f"  {model_display[name]} F1: {f1_score_val:.4f} [{f1_lower:.4f}, {f1_upper:.4f}]")
+            bootstrap_results.append({
+                'Model': model_display[name],
+                'Metric': 'F1-Score',
+                'Empirical_Mean': round(f1_score_val, 4),
+                'CI_Lower': round(f1_lower, 4),
+                'CI_Upper': round(f1_upper, 4)
+            })
+
+    # Save all results
+    delong_df = pd.DataFrame(delong_results)
+    bootstrap_df = pd.DataFrame(bootstrap_results)
+
+    combined_path = os.path.join(output_dir, "statistical_validation.csv")
+    with open(combined_path, 'w') as f:
+        f.write("DeLong Test Results\n")
+        delong_df.to_csv(f, index=False)
+        f.write("\nBootstrap CI Results\n")
+        bootstrap_df.to_csv(f, index=False)
+    print(f"\nResults saved to: {combined_path}")
+
+    return delong_df, bootstrap_df
+
+
+# ======================================================================
+# PART C: Explanation Stability & Cross-Method Alignment
+# ======================================================================
+
+def run_explanation_stability(data_dir="data/processed", model_dir="models", output_dir="results/tables"):
+    """
+    Measure cross-method agreement between TreeSHAP and LIME across
+    identical predictions via Spearman rank correlation.
+    """
+    print("\n" + "=" * 60)
+    print("Explanation Stability & Cross-Method Alignment")
+    print("=" * 60)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load XGBoost model
+    raw_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw_model, ImbPipeline):
+        xgb_model = raw_model.named_steps['classifier']
+    else:
+        xgb_model = raw_model
+
+    # Load and sanitize data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+    X_test.columns = (X_test.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+    feature_names = X_test.columns.tolist()
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    X_train.columns = (X_train.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    # Sample 1000 random test instances
+    n_eval = min(1000, len(X_test))
+    rng = np.random.RandomState(42)
+    eval_indices = rng.choice(len(X_test), n_eval, replace=False)
+    X_eval = X_test.iloc[eval_indices]
+
+    # Apply XGBoost 3.2.0 compatibility patch
+    _patch_xgboost_shap_compat()
+
+    # TreeSHAP explanations
+    print("Generating TreeSHAP explanations for 1000 patients...")
+    X_train_bg = shap.sample(X_train, 100, random_state=42)
+    shap_explainer = shap.TreeExplainer(xgb_model, data=X_train_bg)
+    shap_values = shap_explainer(X_eval)
+    # Use class 1 (readmitted) SHAP values
+    if len(shap_values.values.shape) == 3:
+        shap_attrib = shap_values.values[:, :, 1]
+    else:
+        shap_attrib = shap_values.values
+
+    # LIME explanations
+    print("Generating LIME explanations for 1000 patients (this may take a few minutes)...")
+    X_train_sample = X_train.sample(min(5000, len(X_train)), random_state=42)
+    lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_train_sample.values,
+        feature_names=feature_names,
+        class_names=['Not Readmitted', 'Readmitted'],
+        mode='classification',
+        kernel_width=0.75,
+        random_state=42
+    )
+
+    lime_attrib = np.zeros((n_eval, len(feature_names)))
+    for i in range(n_eval):
+        exp = lime_explainer.explain_instance(
+            data_row=X_eval.iloc[i].values,
+            predict_fn=xgb_model.predict_proba,
+            num_features=len(feature_names)
+        )
+        for feat_idx, weight in exp.local_exp[1]:
+            lime_attrib[i, feat_idx] = weight
+        if (i + 1) % 200 == 0:
+            print(f"  LIME progress: {i+1}/{n_eval}")
+
+    # Compute per-patient Spearman rank correlations
+    print("\nComputing cross-method rank correlations...")
+    patient_rhos = []
+    for i in range(n_eval):
+        shap_ranks = pd.Series(np.abs(shap_attrib[i])).rank(ascending=False)
+        lime_ranks = pd.Series(np.abs(lime_attrib[i])).rank(ascending=False)
+        rho, _ = spearmanr(shap_ranks, lime_ranks)
+        patient_rhos.append(rho)
+
+    mean_rho = np.mean(patient_rhos)
+    print(f"  Mean Spearman Rank Correlation (SHAP, LIME): {mean_rho:.2f}")
+
+    # Top-k feature alignment across all patients
+    shap_global = np.abs(shap_attrib).mean(axis=0)
+    lime_global = np.abs(lime_attrib).mean(axis=0)
+
+    shap_top3 = set(np.argsort(shap_global)[-3:])
+    lime_top3 = set(np.argsort(lime_global)[-3:])
+    top3_overlap = len(shap_top3 & lime_top3) / 3 * 100
+
+    shap_top5 = set(np.argsort(shap_global)[-5:])
+    lime_top5 = set(np.argsort(lime_global)[-5:])
+    top5_overlap = len(shap_top5 & lime_top5) / 5 * 100
+
+    print(f"  Top 3 Feature Alignment Rate: {top3_overlap:.1f}%")
+    print(f"  Top 5 Feature Alignment Rate: {top5_overlap:.1f}%")
+
+    # Save results
+    results = pd.DataFrame({
+        'Metric': [
+            'Mean Spearman Rank Correlation (SHAP, LIME)',
+            'Top 3 Feature Alignment Rate (%)',
+            'Top 5 Feature Alignment Rate (%)',
+            'N_patients_evaluated',
+        ],
+        'Value': [round(mean_rho, 2), round(top3_overlap, 1), round(top5_overlap, 1), n_eval]
+    })
+    csv_path = os.path.join(output_dir, "explanation_stability.csv")
+    results.to_csv(csv_path, index=False)
+    print(f"\nResults saved to: {csv_path}")
+
+    return results
+
+
+if __name__ == "__main__":
+    run_clinical_faithfulness()
+    run_statistical_validation()
+    run_explanation_stability()
+
+
+================================================================================
+11. FIGURES — src/figures/plot_roc_curves.py (Figure 4.1)
+================================================================================
+import os
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, roc_auc_score
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def plot_roc_curves(data_dir=None, model_dir=None, output_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+    if output_dir is None:
+        output_dir = os.path.join(ROOT_DIR, "results", "figures")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # Sanitize for XGBoost
+    X_test_xgb = X_test.copy()
+    X_test_xgb.columns = (X_test_xgb.columns
+                          .str.replace('[', '_', regex=False)
+                          .str.replace(']', '_', regex=False)
+                          .str.replace('<', 'lt_', regex=False)
+                          .str.replace('>', 'gt_', regex=False))
+
+    models = {
+        "Logistic Regression": ("logistic_regression.pkl", X_test),
+        "Decision Tree": ("decision_tree.pkl", X_test),
+        "Random Forest": ("random_forest.pkl", X_test),
+        "XGBoost": ("xgboost.pkl", X_test_xgb),
+    }
+
+    colors = {
+        "Logistic Regression": "#1f77b4",
+        "Decision Tree": "#ff7f0e",
+        "Random Forest": "#2ca02c",
+        "XGBoost": "#d62728",
+    }
+
+    plt.figure(figsize=(10, 8))
+
+    for name, (filename, X_input) in models.items():
+        raw = joblib.load(os.path.join(model_dir, filename))
+        if isinstance(raw, ImbPipeline):
+            model = raw.named_steps['classifier']
+        else:
+            model = raw
+
+        probs = model.predict_proba(X_input)[:, 1]
+        fpr, tpr, _ = roc_curve(y_test, probs)
+        auc = roc_auc_score(y_test, probs)
+
+        plt.plot(fpr, tpr, color=colors[name], lw=2,
+                 label=f"{name} (AUC = {auc:.4f})")
+
+    plt.plot([0, 1], [0, 1], color="gray", lw=1, linestyle="--", label="Chance")
+    plt.xlim([-0.02, 1.02])
+    plt.ylim([-0.02, 1.02])
+    plt.xlabel("False Positive Rate", fontsize=13)
+    plt.ylabel("True Positive Rate", fontsize=13)
+    plt.title("ROC Performance Progression Across Candidate Models", fontsize=14)
+    plt.legend(loc="lower right", fontsize=11, frameon=True)
+    plt.tight_layout()
+
+    out_path = os.path.join(output_dir, "figure4_1_roc_curves.png")
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    print(f"Figure 4.1 saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    plot_roc_curves()
+
+
+================================================================================
+12. FIGURES — src/figures/plot_shap_top10.py (Figure 4.2)
+================================================================================
+import os
+import sys
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "explainability"))
+from shap_analysis import _patch_xgboost_shap_compat
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def plot_shap_top10(data_dir=None, model_dir=None, output_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+    if output_dir is None:
+        output_dir = os.path.join(ROOT_DIR, "results", "figures")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load model
+    raw = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw, ImbPipeline):
+        xgb_model = raw.named_steps['classifier']
+    else:
+        xgb_model = raw
+
+    # Load and sanitize data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    X_test.columns = (X_test.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    X_train.columns = (X_train.columns
+                       .str.replace('[', '_', regex=False)
+                       .str.replace(']', '_', regex=False)
+                       .str.replace('<', 'lt_', regex=False)
+                       .str.replace('>', 'gt_', regex=False))
+
+    X_test_sample = shap.sample(X_test, 1000, random_state=42)
+    X_train_bg = shap.sample(X_train, 100, random_state=42)
+
+    # Compute SHAP values
+    _patch_xgboost_shap_compat()
+    explainer = shap.TreeExplainer(xgb_model, data=X_train_bg)
+    shap_values = explainer(X_test_sample)
+
+    if len(shap_values.values.shape) == 3:
+        shap_attrib = shap_values.values[:, :, 1]
+    else:
+        shap_attrib = shap_values.values
+
+    # Compute mean |SHAP| per feature
+    mean_abs_shap = np.abs(shap_attrib).mean(axis=0)
+    feature_names = X_test_sample.columns.tolist()
+
+    importance_df = pd.DataFrame({
+        'Feature': feature_names,
+        'Mean|SHAP|': mean_abs_shap
+    }).sort_values('Mean|SHAP|', ascending=False).head(10)
+
+    # Plot horizontal bar chart
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.barh(range(len(importance_df)), importance_df['Mean|SHAP|'].values,
+                   color='#d62728', edgecolor='white', height=0.7)
+    ax.set_yticks(range(len(importance_df)))
+    ax.set_yticklabels(importance_df['Feature'].values, fontsize=11)
+    ax.invert_yaxis()
+    ax.set_xlabel("Mean |SHAP Value|", fontsize=13)
+    ax.set_title("Top-10 Global Feature Attributions via TreeSHAP", fontsize=14)
+
+    for i, (val, name) in enumerate(zip(importance_df['Mean|SHAP|'].values,
+                                         importance_df['Feature'].values)):
+        ax.text(val + 0.001, i, f"{val:.4f}", va='center', fontsize=10)
+
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    out_path = os.path.join(output_dir, "figure4_2_shap_top10.png")
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    print(f"Figure 4.2 saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    plot_shap_top10()
+
+
+================================================================================
+13. FIGURES — src/figures/plot_lime_patients.py (Figures 4.3a + 4.3b)
+================================================================================
+import os
+import sys
+import joblib
+import numpy as np
+import pandas as pd
+import lime.lime_tabular
+import matplotlib.pyplot as plt
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+def plot_lime_patient(data_dir=None, model_dir=None, output_dir=None,
+                       patient_idx=15, suffix="4a"):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+    if output_dir is None:
+        output_dir = os.path.join(ROOT_DIR, "results", "figures")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load model
+    raw = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    if isinstance(raw, ImbPipeline):
+        xgb_model = raw.named_steps['classifier']
+    else:
+        xgb_model = raw
+
+    # Load and sanitize data
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+    X_test.columns = (X_test.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    X_train.columns = (X_train.columns
+                       .str.replace('[', '_', regex=False)
+                       .str.replace(']', '_', regex=False)
+                       .str.replace('<', 'lt_', regex=False)
+                       .str.replace('>', 'gt_', regex=False))
+
+    X_train_sample = X_train.sample(min(5000, len(X_train)), random_state=42)
+
+    # Create LIME explainer
+    lime_explainer = lime.lime_tabular.LimeTabularExplainer(
+        training_data=X_train_sample.values,
+        feature_names=X_test.columns.tolist(),
+        class_names=['Not Readmitted', 'Readmitted'],
+        mode='classification',
+        kernel_width=0.75,
+        random_state=42
+    )
+
+    # Generate explanation for specified patient
+    exp = lime_explainer.explain_instance(
+        data_row=X_test.iloc[patient_idx].values,
+        predict_fn=xgb_model.predict_proba,
+        num_features=10
+    )
+
+    prob = xgb_model.predict_proba(X_test.iloc[[patient_idx]])[:, 1][0]
+    actual = y_test[patient_idx]
+
+    # Get feature weights
+    weights = dict(exp.local_exp[1])
+    features = list(weights.keys())
+    values = [weights[f] for f in features]
+    labels = [X_test.columns[f] for f in features]
+
+    # Color: green for negative (reduces risk), red for positive (increases risk)
+    colors = ['#d62728' if v > 0 else '#2ca02c' for v in values]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    y_pos = range(len(labels))
+    ax.barh(y_pos, values, color=colors, edgecolor='white', height=0.6)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=11)
+    ax.invert_yaxis()
+    ax.set_xlabel("Feature Contribution Weight", fontsize=13)
+    ax.set_title(
+        f"LIME Local Explanation — Patient #{patient_idx} "
+        f"(Actual: {'Readmitted' if actual == 1 else 'Not Readmitted'}, "
+        f"Predicted P(Readmit) = {prob:.4f})",
+        fontsize=12
+    )
+    ax.axvline(x=0, color='gray', lw=0.8, linestyle='--')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+
+    out_path = os.path.join(output_dir, f"figure4_{suffix}_lime_patient{patient_idx}.png")
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    print(f"Figure 4.{suffix} (Patient #{patient_idx}) saved to: {out_path}")
+
+
+if __name__ == "__main__":
+    plot_lime_patient(patient_idx=15, suffix="3a")
+    plot_lime_patient(patient_idx=7, suffix="3b")
+
+
+================================================================================
+14. FIGURES — src/figures/plot_dice_recourse_443.py (Figure 4.4)
+================================================================================
+import os
+import sys
+import joblib
+import numpy as np
+import pandas as pd
+import dice_ml
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+ROOT_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+
+class XGBoostDiceWrapper:
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.named_steps = pipeline.named_steps
+
+    def predict_proba(self, X):
+        if isinstance(X, pd.DataFrame):
+            X = X.copy()
+            X = X.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+        else:
+            X = pd.DataFrame(X, columns=self.named_steps['classifier'].get_booster().feature_names)
+        return self.pipeline.predict_proba(X)
+
+    def predict(self, X):
+        return self.pipeline.predict(X)
+
+
+def run_dice_for_patient_443(data_dir=None, model_dir=None, output_dir=None):
+    if data_dir is None:
+        data_dir = os.path.join(ROOT_DIR, "data", "processed")
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, "models")
+    if output_dir is None:
+        output_dir = os.path.join(ROOT_DIR, "results", "figures")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load data
+    X_train = pd.read_csv(os.path.join(data_dir, "X_train.csv"))
+    y_train = pd.read_csv(os.path.join(data_dir, "y_train.csv")).values.ravel()
+    X_test = pd.read_csv(os.path.join(data_dir, "X_test.csv"))
+    y_test = pd.read_csv(os.path.join(data_dir, "y_test.csv")).values.ravel()
+
+    # Sanitize column names
+    for df in [X_train, X_test]:
+        df.columns = (df.columns
+                      .str.replace('[', '_', regex=False)
+                      .str.replace(']', '_', regex=False)
+                      .str.replace('<', 'lt_', regex=False)
+                      .str.replace('>', 'gt_', regex=False))
+
+    # Load model
+    raw_model = joblib.load(os.path.join(model_dir, "xgboost.pkl"))
+    xgb_model = raw_model.named_steps['classifier'] if isinstance(raw_model, ImbPipeline) else raw_model
+
+    # Find highest-risk readmitted patient
+    probs = xgb_model.predict_proba(X_test)[:, 1]
+    readmitted_mask = y_test == 1
+    readmitted_indices = np.where(readmitted_mask)[0]
+    readmitted_probs = probs[readmitted_mask]
+    sorted_idx = readmitted_indices[np.argsort(-readmitted_probs)]
+    patient_idx = sorted_idx[0]  # highest-risk readmitted patient
+    print(f"Selected Patient #{patient_idx}: Actual=Readmitted, P(Readmit)={probs[patient_idx]:.4f}")
+
+    patient_original = X_test.iloc[patient_idx].copy()
+    patient_actual = y_test[patient_idx]
+    patient_prob_original = xgb_model.predict_proba(patient_original.values.reshape(1, -1))[0, 1]
+    print(f"Patient #{patient_idx}: Actual={'Readmitted' if patient_actual==1 else 'Not Readmitted'}, "
+          f"P(Readmit)={patient_prob_original:.4f}")
+
+    # Identify feature types
+    continuous_features = [c for c in X_train.columns
+                           if X_train[c].nunique() > 2
+                           and not any(c.startswith(p) for p in ['age_', 'gender_', 'race_', 'diag_'])]
+
+    # Immutable features
+    immutable_prefixes = ('age_', 'gender_', 'race_', 'diag_1_', 'diag_2_', 'diag_3_')
+
+    # Build DiCE data object
+    train_df = X_train.copy()
+    train_df['readmitted'] = y_train
+
+    dice_data = dice_ml.Data(
+        dataframe=train_df,
+        continuous_features=continuous_features,
+        outcome_name='readmitted'
+    )
+
+    # Wrap model
+    wrapped = XGBoostDiceWrapper(raw_model)
+    dice_model = dice_ml.Model(model=wrapped, backend="sklearn", model_type="classifier")
+
+    # Create explainer
+    dice_explainer = dice_ml.Dice(dice_data, dice_model, method="random")
+
+    # Generate counterfactuals
+    print(f"Generating counterfactuals for patient #{patient_idx}...")
+    patient_df = patient_original.to_frame().T
+    cf_result = dice_explainer.generate_counterfactuals(
+        patient_df,
+        total_CFs=3,
+        desired_class=0,
+        posthoc_sparsity_param=0.1,
+        permitted_range=None
+    )
+
+    cf_example = cf_result.cf_examples_list[0]
+    cf_df = cf_example.final_cfs_df
+    if cf_df is None or len(cf_df) == 0:
+        print("No counterfactuals generated")
+        return
+    # Drop the outcome column if present
+    if 'readmitted' in cf_df.columns:
+        cf_df = cf_df.drop(columns=['readmitted'])
+    print(f"Generated {len(cf_df)} counterfactuals")
+
+    # Compute probabilities for each counterfactual
+    probs_original = xgb_model.predict_proba(patient_df)[0, 1]
+    probs_cf = []
+    for i in range(len(cf_df)):
+        p = xgb_model.predict_proba(cf_df.iloc[[i]])[0, 1]
+        probs_cf.append(p)
+
+    # Find changed features for each CF
+    changed_features = []
+    for i in range(len(cf_df)):
+        diff = cf_df.iloc[i] - patient_original
+        changed = diff[diff != 0].index.tolist()
+        # Filter to actionable features only
+        changed = [f for f in changed if not any(f.startswith(p) for p in immutable_prefixes)]
+        changed_features.append(changed)
+
+    # === PLOT: Dual-pane figure ===
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Panel A: Probability shift
+    labels = ['Original'] + [f'CF {i+1}' for i in range(len(cf_df))]
+    probs = [probs_original] + probs_cf
+    colors_a = ['#d62728'] + ['#2ca02c'] * len(cf_df)
+
+    bars_a = ax1.bar(labels, probs, color=colors_a, edgecolor='white', width=0.6)
+    ax1.axhline(y=0.5, color='gray', lw=1, linestyle='--', label='Decision boundary')
+    ax1.set_ylabel("Predicted P(Readmission)", fontsize=12)
+    ax1.set_title("Panel A: Probability Shift via Counterfactuals", fontsize=13)
+    ax1.set_ylim(0, max(probs) * 1.15)
+    ax1.legend(fontsize=10)
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+
+    for bar, p in zip(bars_a, probs):
+        ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                 f"{p:.3f}", ha='center', va='bottom', fontsize=11)
+
+    # Panel B: Feature changes (for CF1 only, as representative)
+    if changed_features[0]:
+        cf1_diff = cf_df.iloc[0][changed_features[0]] - patient_original[changed_features[0]]
+        feat_labels = changed_features[0][:10]  # Top 10 changed
+        feat_vals = [cf1_diff[f] for f in feat_labels]
+
+        colors_b = ['#d62728' if v > 0 else '#2ca02c' for v in feat_vals]
+        ax2.barh(range(len(feat_labels)), feat_vals, color=colors_b, edgecolor='white', height=0.6)
+        ax2.set_yticks(range(len(feat_labels)))
+        ax2.set_yticklabels(feat_labels, fontsize=10)
+        ax2.invert_yaxis()
+        ax2.set_xlabel("Feature Change (Counterfactual − Original)", fontsize=12)
+        ax2.set_title("Panel B: Actionable Feature Modifications (CF 1)", fontsize=13)
+        ax2.axvline(x=0, color='gray', lw=0.8, linestyle='--')
+    else:
+        ax2.text(0.5, 0.5, "No feature changes", ha='center', va='center',
+                 transform=ax2.transAxes, fontsize=14)
+        ax2.set_title("Panel B: Actionable Feature Modifications (CF 1)", fontsize=13)
+
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+
+    fig.suptitle(f"DiCE Algorithmic Recourse — Patient #{patient_idx}", fontsize=14, y=1.02)
+    plt.tight_layout()
+
+    out_path = os.path.join(output_dir, "figure4_4_dice_recourse_443.png")
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Figure 4.4 saved to: {out_path}")
+
+    # Save counterfactuals CSV
+    csv_path = os.path.join(ROOT_DIR, "results", "tables", f"patient_{patient_idx}_counterfactuals.csv")
+    cf_df.to_csv(csv_path, index=False)
+    print(f"Counterfactuals CSV saved to: {csv_path}")
+
+
+if __name__ == "__main__":
+    run_dice_for_patient_443()
+
+
+================================================================================
+END OF CODEBASE
+================================================================================
